@@ -40,6 +40,7 @@ from typing import Any, Iterable
 from huggingface_hub import snapshot_download
 import jsonlines
 import numpy as np
+import pyarrow as pa
 import pyarrow.parquet as pq
 import tqdm
 
@@ -170,55 +171,91 @@ def convert_info(
     write_info(info, new_root)
 
 
-def _group_episodes_by_data_file(
-    episode_records: Iterable[dict[str, Any]],
-) -> dict[tuple[int, int], list[dict[str, Any]]]:
-    grouped: dict[tuple[int, int], list[dict[str, Any]]] = defaultdict(list)
-    for record in episode_records:
-        key = (
-            int(record["data/chunk_index"]),
-            int(record["data/file_index"]),
-        )
-        grouped[key].append(record)
-    return grouped
+def _build_data_file_spans(root: Path) -> list[tuple[Path, int, int]]:
+    """Return sorted data files with their global index range [start, stop)."""
+
+    spans: list[tuple[Path, int, int]] = []
+    data_paths = sorted((root / "data").glob("chunk-*/file-*.parquet"))
+    if not data_paths:
+        raise FileNotFoundError(f"No consolidated parquet files found under {root / 'data'}")
+
+    for path in data_paths:
+        table = pq.read_table(path, columns=["index"])
+        if table.num_rows == 0:
+            continue
+        indices = table.column("index").combine_chunks().to_numpy()
+        if np.any(indices[1:] < indices[:-1]):
+            raise ValueError(f"Data indices are not sorted in source parquet: {path}")
+        spans.append((path, int(indices[0]), int(indices[-1]) + 1))
+
+    spans.sort(key=lambda item: (item[1], item[2], item[0].as_posix()))
+    return spans
+
+
+def _slice_episode_from_data_spans(
+    spans: list[tuple[Path, int, int]],
+    start: int,
+    stop: int,
+) -> pa.Table:
+    parts = []
+    for path, file_start, file_stop in spans:
+        if file_stop <= start:
+            continue
+        if file_start >= stop:
+            break
+        table = pq.read_table(path)
+        indices = table.column("index").combine_chunks().to_numpy()
+        local_start = max(start, file_start)
+        local_stop = min(stop, file_stop)
+        start_pos = int(np.searchsorted(indices, local_start, side="left"))
+        stop_pos = int(np.searchsorted(indices, local_stop, side="left"))
+        if stop_pos > start_pos:
+            parts.append(table.slice(start_pos, stop_pos - start_pos))
+
+    if not parts:
+        raise ValueError(f"No source rows found for dataset index range [{start}, {stop})")
+    if len(parts) == 1:
+        return parts[0]
+    return pa.concat_tables(parts)
 
 
 def convert_data(
     root: Path, new_root: Path, episode_records: list[dict[str, Any]], chunks_size: int
 ) -> None:
     logging.info("Converting consolidated parquet files back to per-episode files")
-    grouped = _group_episodes_by_data_file(episode_records)
+    # Some v3 datasets can have stale per-episode data/file_index metadata. Use the
+    # global frame index stored in each data file as the source of truth instead.
+    spans = _build_data_file_spans(root)
 
-    for (chunk_idx, file_idx), records in tqdm.tqdm(grouped.items(), desc="convert data files"):
-        source_path = root / DEFAULT_DATA_PATH.format(chunk_index=chunk_idx, file_index=file_idx)
-        if not source_path.exists():
-            raise FileNotFoundError(f"Expected source parquet file not found: {source_path}")
+    for record in tqdm.tqdm(
+        sorted(episode_records, key=lambda rec: int(rec["episode_index"])),
+        desc="convert data episodes",
+    ):
+        episode_index = int(record["episode_index"])
+        start = int(record["dataset_from_index"])
+        stop = int(record["dataset_to_index"])
+        length = stop - start
 
-        table = pq.read_table(source_path)
-        records = sorted(records, key=lambda rec: int(rec["dataset_from_index"]))
-        file_offset = int(records[0]["dataset_from_index"])
-
-        for record in records:
-            episode_index = int(record["episode_index"])
-            start = int(record["dataset_from_index"]) - file_offset
-            stop = int(record["dataset_to_index"]) - file_offset
-            length = stop - start
-
-            if length <= 0:
-                raise ValueError(
-                    "Invalid episode length computed during data conversion: "
-                    f"episode_index={episode_index}, length={length}"
-                )
-
-            episode_table = table.slice(start, length)
-
-            dest_chunk = episode_index // chunks_size
-            dest_path = new_root / LEGACY_DATA_PATH_TEMPLATE.format(
-                episode_chunk=dest_chunk,
-                episode_index=episode_index,
+        if length <= 0:
+            raise ValueError(
+                "Invalid episode length computed during data conversion: "
+                f"episode_index={episode_index}, length={length}"
             )
-            dest_path.parent.mkdir(parents=True, exist_ok=True)
-            pq.write_table(episode_table, dest_path)
+
+        episode_table = _slice_episode_from_data_spans(spans, start, stop)
+        if episode_table.num_rows != length:
+            raise ValueError(
+                "Converted episode row count does not match metadata: "
+                f"episode_index={episode_index}, expected={length}, got={episode_table.num_rows}"
+            )
+
+        dest_chunk = episode_index // chunks_size
+        dest_path = new_root / LEGACY_DATA_PATH_TEMPLATE.format(
+            episode_chunk=dest_chunk,
+            episode_index=episode_index,
+        )
+        dest_path.parent.mkdir(parents=True, exist_ok=True)
+        pq.write_table(episode_table, dest_path)
 
 
 def _group_episodes_by_video_file(
